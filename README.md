@@ -59,6 +59,9 @@
   - First, only the last (classification) layer of the model is trained, allowing rapid adaptation.
   - Then, the entire model is unfrozen and trained for a few more epochs (full fine-tuning).
   - This approach maximizes knowledge transfer while preventing overfitting and reducing compute requirements.
+- **Model used for fine-tuning:**  
+  - The fine-tuning was performed using a **ResNet18 model pretrained on ImageNet**.  
+  - The model was adapted to accept single-channel audio features and trained further on the Parkinson's speech data.
 
 ---
 
@@ -113,6 +116,13 @@ After completion, check the following folders:
 - `outputs/results/` – contains additional metrics, logs, and model weights
 
 ---
+
+## Contribution
+
+Contributions are welcome! Please open issues or pull requests for suggestions, bug reports, or improvements.
+
+---
+
 ## Contact
 
 For questions or collaboration, please contact [ClaudiaAngela](https://github.com/ClaudiaAngela).
