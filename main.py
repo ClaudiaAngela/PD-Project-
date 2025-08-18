@@ -1,289 +1,313 @@
 import os
-import warnings
-import numpy as np
-import matplotlib.pyplot as plt
+import random
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 import torchaudio
+import torchvision
+import numpy as np
 import pandas as pd
-import torchvision.models as models
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
 
-warnings.filterwarnings("ignore")
-import time
-start = time.time()
-
-# === CONFIG ===
-HC_CSV = r"data/neurovoz/metadata/metadata_hc.csv"
-PD_CSV = r"data/neurovoz/metadata/metadata_pd.csv"
-PC_MONOLOGUE_CSV = r"data/neurovoz/PC-GITA_16kHz/PCGITA_metadata_monologue.csv"
-AUDIO_FOLDER = r"data/neurovoz/audios"
-os.makedirs("outputs/mfcc", exist_ok=True)
-os.makedirs("outputs/mel", exist_ok=True)
-os.makedirs("outputs/waveforms", exist_ok=True)
-BATCH_SIZE = 4
-EPOCHS_HEAD = 10
-EPOCHS_FULL = 10
-LR_HEAD = 1e-3
-LR_FULL = 1e-4
-MAX_LEN = 160
+# --- Configs ---
+SR = 16000
+SEGMENT_SEC = 3.0
+SEGMENT_LENGTH = int(SR * SEGMENT_SEC)
+OVERLAP_SEC = 1.0
+OVERLAP = int(SR * OVERLAP_SEC)
+BATCH_SIZE = 16
+EPOCHS = 30
+N_MELS = 224
+N_FRAMES = 224
+N_MFCC = 13
+MODELS = ['resnet18']
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_CLASSES = 2
-LABEL_MAP = {0: "HC", 1: "PD"}
-NOTEBOOK_FOLDER = "notebook_models"
-os.makedirs(NOTEBOOK_FOLDER, exist_ok=True)
 
-# === Custom Dataset ===
-class NeurovozDataset(Dataset):
-    def __init__(self, df, transform=None, sample_rate=16000, max_len=MAX_LEN):
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
-        self.sample_rate = sample_rate
-        self.max_len = max_len
+def segment_audio(waveform, segment_length, overlap):
+    # Segment the waveform into overlapping segments
+    segments = []
+    step = segment_length - overlap
+    for start in range(0, waveform.shape[-1] - segment_length + 1, step):
+        seg = waveform[..., start:start + segment_length]
+        segments.append(seg)
+    return segments
+
+def save_spec_image(spec, filename):
+    # Save a spectrogram image (normalized)
+    spec_np = spec.permute(1,2,0).cpu().numpy()
+    spec_np = (spec_np - spec_np.min()) / (spec_np.max() - spec_np.min() + 1e-8)
+    plt.imsave(filename, spec_np)
+
+def save_mfcc(mfcc, filename):
+    # Save MFCC features to a .npy file
+    mfcc_np = mfcc.cpu().numpy()
+    np.save(filename, mfcc_np)
+
+def save_waveform(waveform, filename):
+    # Save waveform to a .npy file
+    waveform_np = waveform.cpu().numpy()
+    np.save(filename, waveform_np)
+
+def waveform_to_spec_and_mfcc(waveform):
+    # Convert waveform to mel spectrogram and MFCC features
+    mel_transform = torchaudio.transforms.MelSpectrogram(
+        sample_rate=SR,
+        n_fft=1024,
+        hop_length=int((waveform.shape[-1]-1)/(N_FRAMES-1)),
+        n_mels=N_MELS
+    )
+    mel = mel_transform(waveform)  # [1, n_mels, n_frames]
+    mel = torchaudio.transforms.AmplitudeToDB()(mel)
+    if mel.dim() == 3 and mel.shape[0] == 1:
+        mel = mel.squeeze(0)
+    if mel.shape[1] > N_FRAMES:
+        mel = mel[:, :N_FRAMES]
+    elif mel.shape[1] < N_FRAMES:
+        mel = torch.nn.functional.pad(mel, (0, N_FRAMES - mel.shape[1]))
+    mel_rgb = mel.unsqueeze(0).repeat(3, 1, 1) # [3, N_MELS, N_FRAMES]
+
+    mfcc_transform = torchaudio.transforms.MFCC(
+        sample_rate=SR,
+        n_mfcc=N_MFCC,
+        melkwargs={
+            "n_fft": 1024,
+            "n_mels": N_MELS,
+            "hop_length": int((waveform.shape[-1]-1)/(N_FRAMES-1)),
+            "mel_scale": "htk"
+        }
+    )
+    mfcc = mfcc_transform(waveform)  # [1, n_mfcc, n_frames]
+    if mfcc.dim() == 3 and mfcc.shape[0] == 1:
+        mfcc = mfcc.squeeze(0)
+    if mfcc.shape[1] > N_FRAMES:
+        mfcc = mfcc[:, :N_FRAMES]
+    elif mfcc.shape[1] < N_FRAMES:
+        mfcc = torch.nn.functional.pad(mfcc, (0, N_FRAMES - mfcc.shape[1]))
+    return mel_rgb, mfcc
+
+class SpeechDataset(Dataset):
+    def __init__(self, file_df, augment=False, save_examples=False, save_limit=5):
+        self.file_df = file_df.copy()
+        self.augment = augment
+        self.save_examples = save_examples
+        self.save_limit = save_limit
+        self.examples_saved = 0
+
+        # Create output folders for waveform, MFCC, and mel spectrogram
+        self.wave_dir = "outputs/waveform"
+        self.mfcc_dir = "outputs/mfcc"
+        self.mel_dir = "outputs/melspec"
+        if save_examples:
+            os.makedirs(self.wave_dir, exist_ok=True)
+            os.makedirs(self.mfcc_dir, exist_ok=True)
+            os.makedirs(self.mel_dir, exist_ok=True)
 
     def __len__(self):
-        return len(self.df)
+        return len(self.file_df)
 
     def __getitem__(self, idx):
-        audio_path = self.df.iloc[idx]["audio_path"]
-        label = self.df.iloc[idx]["label"]
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
-        if self.transform:
-            features = self.transform(waveform)
+        row = self.file_df.iloc[idx]
+        wav, sr = torchaudio.load(row['filepath'])
+        # If the waveform is longer than the segment length, randomly select a segment
+        if wav.shape[1] > SEGMENT_LENGTH:
+            segments = segment_audio(wav, SEGMENT_LENGTH, OVERLAP)
+            wav = random.choice(segments)
         else:
-            features = waveform
-        if features.dim() == 2:
-            features = features.unsqueeze(0)
-        T = features.shape[-1]
-        if T < self.max_len:
-            pad = self.max_len - T
-            features = torch.nn.functional.pad(features, (0, pad))
-        elif T > self.max_len:
-            features = features[..., :self.max_len]
-        return features, label
+            # If the waveform is shorter, pad it
+            if wav.shape[1] < SEGMENT_LENGTH:
+                wav = torch.nn.functional.pad(wav, (0, SEGMENT_LENGTH - wav.shape[1]))
+        # If augmentation is enabled, add noise
+        if self.augment:
+            wav = wav + 0.01 * torch.randn_like(wav)
+        spec, mfcc = waveform_to_spec_and_mfcc(wav)
+        # Save only for the first save_limit examples
+        if self.save_examples and self.examples_saved < self.save_limit:
+            base_name = f"{idx}_{row['label']}_{row['corpus']}"
+            save_waveform(wav, os.path.join(self.wave_dir, f"{base_name}.npy"))
+            save_mfcc(mfcc, os.path.join(self.mfcc_dir, f"{base_name}.npy"))
+            save_spec_image(spec, os.path.join(self.mel_dir, f"{base_name}.jpg"))
+            self.examples_saved += 1
+        label = 0 if row['label'] == 'HC' else 1
+        return spec, label, mfcc
 
-# === DataFrame preparation ===
-def prepare_neurovoz_dataframe(hc_csv, pd_csv, pc_csv):
-    hc_df = pd.read_csv(hc_csv)
-    pd_df = pd.read_csv(pd_csv)
-    pc_df = pd.read_csv(pc_csv)
-
-    hc_df["label"] = 0
-    pd_df["label"] = 1
-    hc_df = hc_df[["Audio", "label"]].rename(columns={"Audio": "audio_path"})
-    pd_df = pd_df[["Audio", "label"]].rename(columns={"Audio": "audio_path"})
-    hc_df["audio_path"] = hc_df["audio_path"].apply(
-        lambda x: os.path.normpath(os.path.join(AUDIO_FOLDER, os.path.basename(x))))
-    pd_df["audio_path"] = pd_df["audio_path"].apply(
-        lambda x: os.path.normpath(os.path.join(AUDIO_FOLDER, os.path.basename(x))))
-    # PC-GITA monologue already has absolute path and correct label
-    pc_df = pc_df[["audio_path", "label"]]
-    df = pd.concat([hc_df, pd_df, pc_df], ignore_index=True)
-    print("First 5 absolute paths generated:")
-    for path in df["audio_path"].head(5):
-        print(f"{path} -- EXISTS: {os.path.isfile(path)}")
-    df = df[df["audio_path"].apply(os.path.isfile)].reset_index(drop=True)
-    print(f"Total number of examples after filtering: {len(df)}")
-    if len(df) == 0:
-        print("NO VALID AUDIO FILES EXIST! Check the path and existence of the files.")
+def prepare_dataframe(neurovoz_dir, pcgita_monologue_dir, sentences_dir):
+    data_rows = []
+    # Neurovoz: label is taken directly from the file name
+    for root, _, files in os.walk(neurovoz_dir):
+        for f in files:
+            if f.endswith('.wav'):
+                label = f.split('_')[0]  # 'PD' or 'HC' at the beginning
+                subject = f.split('_')[1] if '_' in f else f.split('.')[0]
+                if label not in ['PD', 'HC']:  # Skip if the label is not correct
+                    continue
+                data_rows.append({'filepath': os.path.join(root, f), 'label': label, 'corpus': 'neurovoz', 'subject': subject})
+    # PC-GITA monologue: folders PD/HC
+    for label in ['PD', 'HC']:
+        label_dir = os.path.join(pcgita_monologue_dir, label)
+        if not os.path.exists(label_dir):
+            continue
+        for root, _, files in os.walk(label_dir):
+            for f in files:
+                if f.endswith('.wav'):
+                    subject = f.split('_')[0]  # or another logic, depending on your format
+                    data_rows.append({'filepath': os.path.join(root, f), 'label': label, 'corpus': 'pcgita_monologue', 'subject': subject})
+    # Sentences: same as neurovoz, if you use it
+    for root, _, files in os.walk(sentences_dir):
+        for f in files:
+            if f.endswith('.wav'):
+                label = f.split('_')[0]
+                subject = f.split('_')[1] if '_' in f else f.split('.')[0]
+                if label not in ['PD', 'HC']:
+                    continue
+                data_rows.append({'filepath': os.path.join(root, f), 'label': label, 'corpus': 'sentence', 'subject': subject})
+    df = pd.DataFrame(data_rows)
     return df
 
-df = prepare_neurovoz_dataframe(HC_CSV, PD_CSV, PC_MONOLOGUE_CSV)
-labels_dict = ["HC", "PD"]
+def stratified_group_split(df):
+    # Stratified split by subject and label
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    X = df['filepath']
+    y = df['label']
+    groups = df['subject']
+    for train_idx, test_idx in sgkf.split(X, y, groups):
+        train_labels = set(df.iloc[train_idx]['label'].unique())
+        test_labels = set(df.iloc[test_idx]['label'].unique())
+        # Ensure both train and test have both labels
+        if train_labels == {'HC', 'PD'} and test_labels == {'HC', 'PD'}:
+            return df.iloc[train_idx].reset_index(drop=True), df.iloc[test_idx].reset_index(drop=True)
+    # Fallback: split by file if valid subject split is not found
+    print("WARNING: Subject split failed. Using file-level stratified split!")
+    train_df, test_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
-# Save ONLY 5 sample images per class (waveform, Mel, MFCC)
-def save_sample_images(df, num_per_class=5):
-    saved_per_class = {0: 0, 1: 0}
-    for i in range(len(df)):
-        label = df.iloc[i]["label"]
-        if saved_per_class[label] >= num_per_class:
-            continue
-        audio_path = df.iloc[i]["audio_path"]
-        basename = os.path.splitext(os.path.basename(audio_path))[0]
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != 16000:
-            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+def get_model(model_name):
+    if model_name == 'resnet18':
+        # Create a ResNet18 model with 3-channel input and correct output classes
+        model = torchvision.models.resnet18(weights='IMAGENET1K_V1')
+        model.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+    else:
+        raise ValueError("Unknown model name")
+    return model
 
-        # Waveform
-        plt.figure(figsize=(8, 2))
-        plt.plot(waveform.t().numpy())
-        plt.title(f"Waveform of {basename} - Label {LABEL_MAP[label]}")
-        plt.axis("off")
-        plt.savefig(f"outputs/waveforms/waveform_{basename}.png", bbox_inches="tight", pad_inches=0)
-        plt.close()
+def train_model(model, train_dl, test_dl, epochs=EPOCHS, lr=1e-4, model_name="model"):
+    # Train the model and evaluate on test data
+    model = model.to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    best_acc = 0
+    best_state = None
+    train_losses, test_accs = [], []
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0
+        for batch in train_dl:
+            specs, labels, mfccs = batch
+            specs, labels = specs.to(DEVICE, dtype=torch.float), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(specs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        train_losses.append(epoch_loss / len(train_dl))
+        # Evaluate
+        model.eval()
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in test_dl:
+                specs, labels, mfccs = batch
+                specs, labels = specs.to(DEVICE, dtype=torch.float), labels.to(DEVICE)
+                outputs = model(specs)
+                preds = outputs.argmax(1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+        acc = correct / total if total > 0 else 0
+        test_accs.append(acc)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = model.state_dict()
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {train_losses[-1]:.4f}, Test Acc: {acc:.4f}")
+    # Save results directly in outputs/results (no subfolder)
+    os.makedirs("outputs/results", exist_ok=True)
+    # Save models in notebook_models
+    os.makedirs("notebook_models", exist_ok=True)
+    torch.save(best_state, f"notebook_models/best_model_{model_name}.pt")
+    plt.figure()
+    plt.plot(range(1, epochs+1), train_losses, label='Train Loss')
+    plt.plot(range(1, epochs+1), test_accs, label='Test Acc')
+    plt.xlabel('Epoch')
+    plt.legend()
+    plt.savefig(f"outputs/results/learning_curve_{model_name}.png")
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure()
+    plt.imshow(cm, cmap='Blues')
+    plt.title('Confusion Matrix')
+    # Add numbers to the squares
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha='center', va='center', color='black', fontsize=16)
+    plt.savefig(f"outputs/results/confusion_matrix_{model_name}.png")
+    with open(f"outputs/results/classification_report_{model_name}.txt", "w") as f:
+        f.write(classification_report(all_labels, all_preds))
 
-        # MelSpectrogram
-        mel = torchaudio.transforms.MelSpectrogram()(waveform)
-        plt.figure(figsize=(6, 3))
-        plt.imshow(mel[0].numpy(), aspect='auto', origin='lower')
-        plt.title(f"MelSpectrogram of {basename} - Label {LABEL_MAP[label]}")
-        plt.axis('off')
-        plt.savefig(f"outputs/mel/mel_{basename}.png", bbox_inches='tight', pad_inches=0)
-        plt.close()
+def run_verifications(train_df, test_df, train_dl, test_dl):
+    print("\n--- Train/Test label verifications ---")
+    print("Train distribution:\n", train_df['label'].value_counts())
+    print("Test distribution:\n", test_df['label'].value_counts())
+    print("\n--- A batch from train_dl (labels) ---")
+    for specs, labels, mfccs in train_dl:
+        print("Train batch labels:", labels)
+        print("Train batch specs shape:", specs.shape)
+        print("Train batch mfcc shape:", mfccs.shape)
+        break
+    print("\n--- A batch from test_dl (labels) ---")
+    for specs, labels, mfccs in test_dl:
+        print("Test batch labels:", labels)
+        print("Test batch specs shape:", specs.shape)
+        print("Test batch mfcc shape:", mfccs.shape)
+        break
 
-        # MFCC
-        mfcc = torchaudio.transforms.MFCC()(waveform)
-        plt.figure(figsize=(6, 3))
-        plt.imshow(mfcc[0].numpy(), aspect='auto', origin='lower')
-        plt.title(f"MFCC of {basename} - Label {LABEL_MAP[label]}")
-        plt.axis('off')
-        plt.savefig(f"outputs/mfcc/mfcc_{basename}.png", bbox_inches='tight', pad_inches=0)
-        plt.close()
+def main():
+    os.makedirs("outputs/results", exist_ok=True)
+    # Set directories (modify these to match your structure)
+    neurovoz_dir = "data/neurovoz"
+    pcgita_monologue_dir = "data/pcgita/monologue"
+    sentences_dir = "data/sentences"
+    # Build the dataframe
+    df = prepare_dataframe(neurovoz_dir, pcgita_monologue_dir, sentences_dir)
+    # Debug subject and label distribution
+    print("Subjects per label:")
+    print(df.groupby('label')['subject'].nunique())
+    print("Label counts:")
+    print(df['label'].value_counts())
+    # Split train/test
+    train_df, test_df = stratified_group_split(df)
+    # Save 5 examples in waveform/mfcc/melspec (no train/test subfolders)
+    all_df = pd.concat([train_df, test_df]).reset_index(drop=True)
+    ds = SpeechDataset(all_df, augment=False, save_examples=True, save_limit=5)
+    dl = DataLoader(ds, batch_size=1, shuffle=False)
+    for _ in dl:
+        pass
+    # Datasets for training
+    train_ds = SpeechDataset(train_df, augment=True, save_examples=False)
+    test_ds = SpeechDataset(test_df, augment=False, save_examples=False)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # Useful verifications
+    run_verifications(train_df, test_df, train_dl, test_dl)
+    for model_name in MODELS:
+        print(f"\nTraining model: {model_name}")
+        model = get_model(model_name)
+        train_model(model, train_dl, test_dl, epochs=EPOCHS, model_name=model_name)
+        print(f"Finished training {model_name}")
 
-        saved_per_class[label] += 1
-        print(f"Saved waveform, MelSpectrogram and MFCC for {basename}.")
-        if all(saved_per_class[l] >= num_per_class for l in LABEL_MAP.keys()):
-            break
-
-save_sample_images(df, num_per_class=5)
-
-# === Select feature type (0 = raw, 1 = MFCC, 2 = MelSpectrogram)
-data_transform = 2
-if data_transform == 1:
-    print("MFCC Features classification")
-    train_audio_transforms = nn.Sequential(
-        torchaudio.transforms.MFCC(log_mels=False)
-    )
-elif data_transform == 2:
-    print("Mel Spectrogram Features classification")
-    train_audio_transforms = nn.Sequential(
-        torchaudio.transforms.MelSpectrogram()
-    )
-else:
-    train_audio_transforms = None
-
-# === Stratified train/test split ===
-train_df, test_df = train_test_split(
-    df,
-    test_size=0.2,
-    stratify=df["label"],
-    random_state=42
-)
-
-# === Create dataset/dataLoader ===
-train_dataset = NeurovozDataset(train_df, transform=train_audio_transforms)
-test_dataset = NeurovozDataset(test_df, transform=train_audio_transforms)
-trainloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-testloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-# === Pretrained ResNet18, adapted for 1-channel input and 2 classes ===
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = models.resnet18(weights="IMAGENET1K_V1")
-model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-model = model.to(device)
-
-# === Train/test functions + metrics ===
-def train(model, loader, optimizer, scheduler, criterion, epoch, device):
-    model.train()
-    total_loss = 0
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        optimizer.zero_grad()
-        out = model(xb)
-        loss = criterion(out, yb)
-        loss.backward()
-        optimizer.step()
-        if scheduler: scheduler.step()
-        total_loss += loss.item() * xb.size(0)
-    avg_loss = total_loss / len(loader.dataset)
-    print(f"[Epoch {epoch+1}] Train loss: {avg_loss:.4f}")
-    return avg_loss
-
-def test(model, loader, criterion, device):
-    model.eval()
-    correct = 0
-    total = 0
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            out = model(xb)
-            pred = out.argmax(1)
-            all_preds.extend(pred.cpu().numpy())
-            all_labels.extend(yb.cpu().numpy())
-            correct += (pred == yb).sum().item()
-            total += yb.size(0)
-    acc = correct / total if total else 0
-    print(f"Test accuracy: {acc:.3f}")
-    return acc, all_labels, all_preds
-
-train_losses = []
-test_accuracies = []
-
-# === Fine-tuning: first only last layer, then all layers ===
-for param in model.parameters():
-    param.requires_grad = False
-for param in model.fc.parameters():
-    param.requires_grad = True
-
-optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR_HEAD)
-scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer,
-    max_lr=LR_HEAD,
-    steps_per_epoch=len(trainloader),
-    epochs=EPOCHS_HEAD,
-    anneal_strategy='linear'
-)
-criterion = nn.CrossEntropyLoss()
-
-print("\n=== FINE-TUNING only the head (last layer) ===")
-for epoch in range(EPOCHS_HEAD):
-    loss = train(model, trainloader, optimizer, scheduler, criterion, epoch, device)
-    train_losses.append(loss)
-    acc, _, _ = test(model, testloader, criterion, device)
-    test_accuracies.append(acc)
-
-# === Fine-tuning ALL layers ===
-for param in model.parameters():
-    param.requires_grad = True
-
-optimizer = torch.optim.Adam(model.parameters(), lr=LR_FULL)
-scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer,
-    max_lr=LR_FULL,
-    steps_per_epoch=len(trainloader),
-    epochs=EPOCHS_FULL,
-    anneal_strategy='linear'
-)
-
-print("\n=== FINE-TUNING ALL layers ===")
-for epoch in range(EPOCHS_FULL):
-    loss = train(model, trainloader, optimizer, scheduler, criterion, epoch, device)
-    train_losses.append(loss)
-    acc, _, _ = test(model, testloader, criterion, device)
-    test_accuracies.append(acc)
-
-# === Final evaluation: Confusion matrix and F1-score on test set ===
-print("\n=== Final evaluation on test set ===")
-_, all_labels, all_preds = test(model, testloader, criterion, device)
-cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["HC", "PD"])
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.savefig("outputs/confusion_matrix.png")
-plt.close()
-
-report = classification_report(all_labels, all_preds, target_names=["HC", "PD"])
-with open("outputs/classification_report.txt", "w") as f:
-    f.write(report)
-print("Classification report:\n", report)
-
-# === Accuracy graph over epochs ===
-plt.figure(figsize=(8, 4))
-plt.plot(np.arange(1, len(test_accuracies) + 1), test_accuracies, marker='o')
-plt.xlabel("Epoch")
-plt.ylabel("Test accuracy")
-plt.title("Test accuracy over epochs")
-plt.grid()
-plt.savefig("outputs/test_accuracy_epochs.png")
-plt.close()
-print(f"Total time: {(time.time()-start)/60:.2f} minutes")
-# === Save the model in the notebook folder ===
-torch.save(model.state_dict(), os.path.join(NOTEBOOK_FOLDER, "model_neurovoz_resnet18_finetuned.pth"))
-print(f"Model saved as {os.path.join(NOTEBOOK_FOLDER, 'model_neurovoz_resnet18_finetuned.pth')}")
-print("Confusion matrix, classification report and accuracy graph have been saved in outputs/")
+if __name__ == "__main__":
+    main()
